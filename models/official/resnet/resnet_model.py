@@ -23,14 +23,42 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.compat.v1 as tf
+import numpy as np
+import tensorflow as tf
 
 BATCH_NORM_DECAY = 0.9
 BATCH_NORM_EPSILON = 1e-5
 
 
-def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
-                    data_format='channels_first'):
+def BlurPool(inputs, data_format='channels_first'):
+  a = np.array([1., 4., 6., 4., 1.])
+  filt = a[:, None] * a[None, :]
+  filt = filt / np.sum(filt)
+
+  filt = tf.Variable(filt, trainable=False, dtype=tf.bfloat16)
+  if data_format == 'channels_first':
+    filt = tf.expand_dims(filt, 0)
+    filt = tf.expand_dims(filt, 0)
+    filt = tf.tile(filt, [inputs.shape[0], inputs.shape[1], 1, 1])
+  else:
+    filt = tf.expand_dims(filt, 0)
+    filt = tf.expand_dims(filt, -1)
+    filt = tf.tile(filt, [inputs.shape[0], 1, 1, inputs.shape[-1]])
+
+  return tf.nn.conv2d(
+      inputs,
+      filt,
+      2,
+      'SAME',
+      data_format='NHWC' if data_format == 'channels_last' else 'NCHW')
+
+
+def batch_norm_relu(inputs,
+                    is_training,
+                    relu=True,
+                    init_zero=False,
+                    data_format='channels_first',
+                    blur=False):
   """Performs a batch normalization followed by a ReLU.
 
   Args:
@@ -68,6 +96,8 @@ def batch_norm_relu(inputs, is_training, relu=True, init_zero=False,
 
   if relu:
     inputs = tf.nn.relu(inputs)
+    if blur:
+      inputs = BlurPool(inputs, data_format=data_format)
   return inputs
 
 
@@ -242,12 +272,13 @@ def residual_block(inputs, filters, is_training, strides,
         inputs=inputs, filters=filters, kernel_size=1, strides=strides,
         data_format=data_format)
     shortcut = batch_norm_relu(shortcut, is_training, relu=False,
-                               data_format=data_format)
+                               data_format=data_format, blur=True)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  inputs = batch_norm_relu(
+      inputs, is_training, data_format=data_format, blur=True)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=1,
@@ -293,7 +324,7 @@ def bottleneck_block(inputs, filters, is_training, strides,
         inputs=inputs, filters=filters_out, kernel_size=1, strides=strides,
         data_format=data_format)
     shortcut = batch_norm_relu(shortcut, is_training, relu=False,
-                               data_format=data_format)
+                               data_format=data_format, blur=True)
   shortcut = dropblock(
       shortcut, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -309,7 +340,8 @@ def bottleneck_block(inputs, filters, is_training, strides,
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+  inputs = batch_norm_relu(
+      inputs, is_training, data_format=data_format, blur=True)
   inputs = dropblock(
       inputs, is_training=is_training, data_format=data_format,
       keep_prob=dropblock_keep_prob, dropblock_size=dropblock_size)
@@ -400,14 +432,16 @@ def resnet_v1_generator(block_fn, layers, num_classes,
   def model(inputs, is_training):
     """Creation of the model graph."""
     inputs = conv2d_fixed_padding(
-        inputs=inputs, filters=64, kernel_size=7, strides=2,
+        inputs=inputs, filters=64, kernel_size=7, strides=1,
         data_format=data_format)
     inputs = tf.identity(inputs, 'initial_conv')
-    inputs = batch_norm_relu(inputs, is_training, data_format=data_format)
+    inputs = batch_norm_relu(
+        inputs, is_training, data_format=data_format, blur=True)
 
     inputs = tf.layers.max_pooling2d(
-        inputs=inputs, pool_size=3, strides=2, padding='SAME',
+        inputs=inputs, pool_size=3, strides=1, padding='SAME',
         data_format=data_format)
+    inputs = BlurPool(inputs, data_format=data_format)
     inputs = tf.identity(inputs, 'initial_max_pool')
 
     inputs = block_group(
@@ -417,17 +451,17 @@ def resnet_v1_generator(block_fn, layers, num_classes,
         dropblock_size=dropblock_size)
     inputs = block_group(
         inputs=inputs, filters=128, block_fn=block_fn, blocks=layers[1],
-        strides=2, is_training=is_training, name='block_group2',
+        strides=1, is_training=is_training, name='block_group2',
         data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[1],
         dropblock_size=dropblock_size)
     inputs = block_group(
         inputs=inputs, filters=256, block_fn=block_fn, blocks=layers[2],
-        strides=2, is_training=is_training, name='block_group3',
+        strides=1, is_training=is_training, name='block_group3',
         data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[2],
         dropblock_size=dropblock_size)
     inputs = block_group(
         inputs=inputs, filters=512, block_fn=block_fn, blocks=layers[3],
-        strides=2, is_training=is_training, name='block_group4',
+        strides=1, is_training=is_training, name='block_group4',
         data_format=data_format, dropblock_keep_prob=dropblock_keep_probs[3],
         dropblock_size=dropblock_size)
 
@@ -453,7 +487,7 @@ def resnet_v1_generator(block_fn, layers, num_classes,
 
 def resnet_v1(resnet_depth, num_classes, data_format='channels_first',
               dropblock_keep_probs=None, dropblock_size=None):
-  """Returns the ResNet model for a given size and number of output classes."""
+  """Dropblock is disabled."""
   model_params = {
       18: {'block': residual_block, 'layers': [2, 2, 2, 2]},
       34: {'block': residual_block, 'layers': [3, 4, 6, 3]},
@@ -469,5 +503,5 @@ def resnet_v1(resnet_depth, num_classes, data_format='channels_first',
   params = model_params[resnet_depth]
   return resnet_v1_generator(
       params['block'], params['layers'], num_classes,
-      dropblock_keep_probs=dropblock_keep_probs, dropblock_size=dropblock_size,
+      dropblock_keep_probs=None, dropblock_size=None,
       data_format=data_format)
